@@ -75,8 +75,8 @@ impl IntentHandler {
 		token_manager: Arc<TokenManager>,
 		cost_profit_service: Arc<CostProfitService>,
 		dynamic_config: Arc<RwLock<Config>>,
+		static_config: &Config,
 	) -> Self {
-		let static_config = tokio::task::block_in_place(|| dynamic_config.blocking_read().clone());
 		let ofac_addresses = Self::load_ofac_list(static_config.solver.ofac_list.as_deref());
 		if ofac_addresses.is_empty() {
 			tracing::warn!("OFAC sanctions list could not be loaded. Enforcement is DISABLED!");
@@ -199,8 +199,8 @@ impl IntentHandler {
 					// recipient is bytes32; the Ethereum address occupies the last 20 bytes.
 					let addr_bytes = &output.recipient[12..];
 					let hex_str: String =
-						addr_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-					let recipient_addr = format!("0x{}", hex_str);
+						addr_bytes.iter().map(|b| format!("{b:02x}")).collect();
+					let recipient_addr = format!("0x{hex_str}");
 					if self.ofac_addresses.contains(&recipient_addr) {
 						tracing::warn!(
 							intent_id = %intent.id,
