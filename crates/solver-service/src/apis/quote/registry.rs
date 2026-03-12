@@ -48,6 +48,7 @@ impl Default for ProtocolRegistry {
 		registry.add_permit2_deployment(421614, PERMIT2_CANONICAL); // Arbitrum Sepolia
 		registry.add_permit2_deployment(11155111, PERMIT2_CANONICAL); // Ethereum Sepolia
 		registry.add_permit2_deployment(11155420, PERMIT2_CANONICAL); // Optimism Sepolia
+		registry.add_permit2_deployment(3735928814, PERMIT2_CANONICAL); // Eden testnet
 
 		// Configure EIP-3009 tokens (USDC on various chains)
 		registry.add_eip3009_token(1, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"); // Mainnet USDC
