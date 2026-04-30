@@ -32,6 +32,10 @@ use std::collections::HashMap;
 pub struct AlloyDelivery {
 	/// Alloy providers for each supported network.
 	providers: HashMap<u64, DynProvider>,
+	/// Signer address per network. Used to refresh the nonce from chain when
+	/// the local cached nonce diverges from reality (e.g. another process
+	/// sharing this key sent a transaction out-of-band).
+	wallet_addresses: HashMap<u64, Address>,
 }
 
 impl AlloyDelivery {
@@ -54,6 +58,7 @@ impl AlloyDelivery {
 		}
 
 		let mut providers = HashMap::new();
+		let mut wallet_addresses = HashMap::new();
 
 		for network_id in &network_ids {
 			// Get network configuration
@@ -79,9 +84,12 @@ impl AlloyDelivery {
 				.cloned()
 				.unwrap_or_else(|| default_signer.clone());
 
-			// Create signer with chain ID
+			// Create signer with chain ID. Capture the address first because
+			// `with_chain_id` consumes the signer.
+			let signer_address = signer.address();
 			let chain_signer = signer.with_chain_id(Some(*network_id));
 			let wallet = EthereumWallet::from(chain_signer);
+			wallet_addresses.insert(*network_id, signer_address);
 
 			// Configure retry layer for handling network errors, rate limits, and execution reverts
 			// Extend the default rate limit policy to also retry execution reverts during transaction submission
@@ -124,7 +132,10 @@ impl AlloyDelivery {
 			providers.insert(*network_id, dyn_provider);
 		}
 
-		Ok(Self { providers })
+		Ok(Self {
+			providers,
+			wallet_addresses,
+		})
 	}
 
 	/// Gets the provider for a specific chain ID.
@@ -133,6 +144,26 @@ impl AlloyDelivery {
 			DeliveryError::Network(format!("No provider configured for chain ID {chain_id}"))
 		})
 	}
+}
+
+/// True for RPC errors that mean the cached nonce is behind chain state.
+/// Different EVM clients phrase this differently (geth, reth, erigon, anvil),
+/// so we match a few variants. The intent is to recover when another process
+/// sharing the same key submitted a transaction out-of-band.
+fn is_nonce_too_low(err: &alloy_transport::RpcError<alloy_transport::TransportErrorKind>) -> bool {
+	use alloy_transport::RpcError;
+	match err {
+		RpcError::ErrorResp(payload) => is_nonce_too_low_message(payload.code, &payload.message),
+		_ => false,
+	}
+}
+
+/// Pure-data classifier for nonce-too-low errors, factored out of
+/// [`is_nonce_too_low`] so it can be unit-tested without constructing alloy
+/// error types.
+fn is_nonce_too_low_message(code: i64, message: &str) -> bool {
+	let msg = message.to_ascii_lowercase();
+	code == -32000 && msg.contains("nonce") && msg.contains("too low")
 }
 
 /// Configuration schema for Alloy delivery provider.
@@ -223,7 +254,7 @@ impl DeliveryInterface for AlloyDelivery {
 		let provider = self.get_provider(chain_id)?;
 
 		// Convert solver transaction to alloy transaction request
-		let request: TransactionRequest = tx.clone().into();
+		let mut request: TransactionRequest = tx.clone().into();
 
 		// Log request details for debugging
 		if tracking.is_some() {
@@ -246,11 +277,56 @@ impl DeliveryInterface for AlloyDelivery {
 			);
 		}
 
-		// Send transaction - the provider's wallet will handle signing
-		let pending_tx = provider.send_transaction(request).await.map_err(|e| {
-			tracing::error!("Transaction submission failed on chain {}: {}", chain_id, e);
-			DeliveryError::Network(format!("Failed to send transaction: {e}"))
-		})?;
+		// Send transaction - the provider's wallet will handle signing.
+		// On a stale-nonce error (another process sharing this key sent a tx
+		// out-of-band), refresh the pending nonce from chain once and retry.
+		let pending_tx = match provider.send_transaction(request.clone()).await {
+			Ok(tx) => tx,
+			Err(e) if is_nonce_too_low(&e) => {
+				let from = self.wallet_addresses.get(&chain_id).copied().ok_or_else(|| {
+					DeliveryError::Network(format!(
+						"Nonce-too-low retry: no wallet address recorded for chain {chain_id}"
+					))
+				})?;
+				let fresh_nonce = provider
+					.get_transaction_count(from)
+					.pending()
+					.await
+					.map_err(|fetch_err| {
+						tracing::error!(
+							"Transaction submission failed on chain {} (nonce too low) and refresh \
+							 failed: send_err={}, fetch_err={}",
+							chain_id,
+							e,
+							fetch_err,
+						);
+						DeliveryError::Network(format!(
+							"Failed to refresh nonce after nonce-too-low: {fetch_err}"
+						))
+					})?;
+				tracing::warn!(
+					"Stale cached nonce on chain {} (send err: {}). Refreshed pending nonce={}, retrying once.",
+					chain_id,
+					e,
+					fresh_nonce
+				);
+				request.nonce = Some(fresh_nonce);
+				provider.send_transaction(request).await.map_err(|retry_err| {
+					tracing::error!(
+						"Transaction submission failed on chain {} after nonce refresh: {}",
+						chain_id,
+						retry_err
+					);
+					DeliveryError::Network(format!("Failed to send transaction: {retry_err}"))
+				})?
+			},
+			Err(e) => {
+				tracing::error!("Transaction submission failed on chain {}: {}", chain_id, e);
+				return Err(DeliveryError::Network(format!(
+					"Failed to send transaction: {e}"
+				)));
+			},
+		};
 
 		// Get the transaction hash
 		let tx_hash = *pending_tx.tx_hash();
@@ -742,6 +818,28 @@ mod tests {
 			<Registry as solver_types::ImplementationRegistry>::NAME,
 			"evm_alloy"
 		);
+	}
+
+	#[test]
+	fn test_is_nonce_too_low_message_matches_known_variants() {
+		// geth / reth / erigon
+		assert!(is_nonce_too_low_message(
+			-32000,
+			"nonce too low: next nonce 129, tx nonce 126"
+		));
+		// case variants
+		assert!(is_nonce_too_low_message(-32000, "Nonce too low"));
+		assert!(is_nonce_too_low_message(-32000, "NONCE TOO LOW"));
+	}
+
+	#[test]
+	fn test_is_nonce_too_low_message_rejects_unrelated() {
+		// different error class
+		assert!(!is_nonce_too_low_message(-32000, "execution reverted"));
+		// nonce-related but not "too low"
+		assert!(!is_nonce_too_low_message(-32000, "nonce too high"));
+		// wrong error code
+		assert!(!is_nonce_too_low_message(3, "nonce too low"));
 	}
 
 	// ========================================================================
